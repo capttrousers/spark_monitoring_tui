@@ -6,12 +6,13 @@ import fs from "node:fs/promises";
 import process from "node:process";
 import logUpdate from "log-update";
 import stringWidth from "string-width";
-import wrapAnsi from "wrap-ansi";
 import { bold, dim, cyan, magenta, green, yellow } from "yoctocolors";
+import stripAnsi from "strip-ansi";
 
 $.quiet = true;
 
 const INTERVAL = Number(process.env.INTERVAL_MS || 1000);
+const ONCE_MODE = process.argv.includes("--once");
 
 // ---------- types ----------
 type MemInfo = {
@@ -27,10 +28,15 @@ type GpuTotal = { name: string; util: number; temp: number; clk: number };
 type PmonRow = {
   gpu: string;
   pid: string;
+  type: string;
   sm: string;
   mem: string;
   enc: string;
   dec: string;
+  jpg: string;
+  ofa: string;
+  fb: string;
+  ccpm: string;
   cmd: string;
 };
 
@@ -79,16 +85,22 @@ async function pmon(): Promise<PmonRow[]> {
     const rows: PmonRow[] = [];
     for (const line of out) {
       const cols = line.trim().split(/\s+/);
-      if (cols.length < 9) continue;
-      const [gpu, , pid, _type, , sm, mem, enc, dec, ...cmdParts] = cols;
+      // Format: gpu pid type sm mem enc dec jpg ofa fb ccpm command
+      if (cols.length < 12) continue;
+      const [gpu, pid, type, sm, mem, enc, dec, jpg, ofa, fb, ccpm, ...cmdParts] = cols;
       if (!/^\d+$/.test(gpu) || !/^\d+$/.test(pid)) continue;
       rows.push({
         gpu,
         pid,
+        type,
         sm,
         mem,
         enc,
         dec,
+        jpg,
+        ofa,
+        fb,
+        ccpm,
         cmd: cmdParts.join(" "),
       });
     }
@@ -98,7 +110,10 @@ async function pmon(): Promise<PmonRow[]> {
   }
 }
 
-const kb = (n?: number) => `${(n || 0).toLocaleString("en-US")} kB`;
+const toGB = (kb?: number): string => {
+  const gb = (kb || 0) / 1024 / 1024;
+  return `${gb.toFixed(2)} GB`;
+};
 
 function pad(s: string, w: number): string {
   const sw = stringWidth(s);
@@ -110,15 +125,51 @@ function line(w: number): string {
 }
 
 function box(title: string, lines: string[], width: number): string {
-  const top = `┌ ${title} ${line(Math.max(0, width - 4 - stringWidth(title)))}┐`;
+  // Ensure width doesn't exceed terminal
+  const safeWidth = Math.min(width, 78);
+  const contentWidth = safeWidth - 4; // Space for "│ " + content + " │"
+  
+  // Top border
+  const titleLen = stripAnsi(title).length;
+  const borderLen = Math.max(0, safeWidth - 4 - titleLen);
+  const top = `┌ ${title} ${"─".repeat(borderLen)}┐`;
+  
+  // Body lines
   const body = lines
     .map((l) => {
-      const wrapped = wrapAnsi(l, width - 4, { hard: true });
-      const padded = pad(wrapped, width - 2);
-      return `│ ${padded} │`;
+      const stripped = stripAnsi(l);
+      let content = l;
+      
+      // Truncate if needed
+      if (stripped.length > contentWidth) {
+        // Find where to cut, accounting for ANSI codes
+        let visibleCount = 0;
+        let cutIndex = 0;
+        for (let i = 0; i < l.length; i++) {
+          if (l[i] === '\x1b') {
+            // Skip ANSI escape sequence
+            while (i < l.length && l[i] !== 'm') i++;
+            continue;
+          }
+          visibleCount++;
+          if (visibleCount >= contentWidth - 1) {
+            cutIndex = i + 1;
+            break;
+          }
+        }
+        content = l.substring(0, cutIndex) + "…";
+      }
+      
+      // Pad to exact width
+      const currentWidth = stripAnsi(content).length;
+      const padding = " ".repeat(Math.max(0, contentWidth - currentWidth));
+      return `│ ${content}${padding} │`;
     })
     .join("\n");
-  const bot = `└${line(width)}┘`;
+  
+  // Bottom border
+  const bot = `└${"─".repeat(safeWidth - 2)}┘`;
+  
   return [top, body, bot].join("\n");
 }
 
@@ -126,7 +177,7 @@ function box(title: string, lines: string[], width: number): string {
 async function render(): Promise<void> {
   const cols = process.stdout.columns ?? 100;
   const rows = process.stdout.rows ?? 40;
-  const half = Math.max(30, Math.floor(cols / 2) - 2);
+  const boxWidth = cols;
 
   const [m, g, procs] = await Promise.all([meminfo(), gpuTotals(), pmon()]);
   const used = m.total - m.avail;
@@ -134,14 +185,14 @@ async function render(): Promise<void> {
   const memBox = box(
     cyan("Memory"),
     [
-      `${bold("Total:")} ${kb(m.total)}`,
-      `${bold("Available:")} ${kb(m.avail)}`,
-      `${bold("Used:")} ${kb(used)}`,
-      `${bold("Free:")} ${kb(m.free)}`,
-      `${bold("Cached:")} ${kb(m.cached)}`,
-      `${bold("Swap Free:")} ${kb(m.swapFree)}`,
+      `${bold("Total:")} ${toGB(m.total)}`,
+      `${bold("Available:")} ${toGB(m.avail)}`,
+      `${bold("Used:")} ${toGB(used)}`,
+      `${bold("Free:")} ${toGB(m.free)}`,
+      `${bold("Cached:")} ${toGB(m.cached)}`,
+      `${bold("Swap Free:")} ${toGB(m.swapFree)}`,
     ],
-    half
+    boxWidth
   );
 
   const gLines =
@@ -153,35 +204,67 @@ async function render(): Promise<void> {
             )}  smclk ${x.clk}MHz`
         )
       : ["nvidia-smi not available"];
-  const gpuBox = box(magenta("GPU Totals"), gLines, half);
+  const gpuBox = box(magenta("GPU Totals"), gLines, boxWidth);
 
-  const header = "GPU  PID      SM%  MEM%  ENC  DEC  CMD";
-  const procWidth = Math.max(30, cols - 4);
-  const maxCmd = Math.max(10, procWidth - 34);
+  const header = "GPU  PID      T  SM%  MEM%  ENC  DEC  JPG  OFA  FB    CCPM  CMD";
+  const maxCmd = Math.max(10, boxWidth - 64);
   const procLines = [bold(header)].concat(
     procs.slice(0, Math.max(1, rows - 16)).map((r) => {
       const cmd =
         r.cmd.length > maxCmd ? r.cmd.slice(0, maxCmd - 1) + "…" : r.cmd;
+      
+      // Format values: replace "-" with "·" and add "MB" suffix to FB/CCPM
+      const formatVal = (v: string) => v === "-" ? "·" : v;
+      const formatMB = (v: string) => {
+        if (v === "-") return "·";
+        const num = Number(v);
+        if (isNaN(num)) return v;
+        if (num >= 1024) return `${(num / 1024).toFixed(1)}G`;
+        return `${num}M`;
+      };
+      
       return `${pad(r.gpu, 3)}  ${pad(String(r.pid), 7)}  ${pad(
-        r.sm,
+        r.type,
+        1
+      )}  ${pad(formatVal(r.sm), 3)}  ${pad(formatVal(r.mem), 4)}  ${pad(
+        formatVal(r.enc),
         3
-      )}  ${pad(r.mem, 4)}  ${pad(r.enc, 3)}  ${pad(r.dec, 3)}  ${cmd}`;
+      )}  ${pad(formatVal(r.dec), 3)}  ${pad(formatVal(r.jpg), 3)}  ${pad(
+        formatVal(r.ofa),
+        3
+      )}  ${pad(formatMB(r.fb), 4)}  ${pad(formatMB(r.ccpm), 4)}  ${cmd}`;
     })
   );
-  const procBox = box(cyan("nvidia-smi pmon (per-process)"), procLines, procWidth);
+  const procBox = box(cyan("nvidia-smi pmon (per-process)"), procLines, boxWidth);
 
-  const memLines = memBox.split("\n");
-  const gpuLines = gpuBox.split("\n");
-  const topRow = memLines
-    .map((l, i) => l + "  " + (gpuLines[i] || ""))
-    .join("\n");
+  const legendLines = [
+    dim("Legend:"),
+    dim("  T    - Type - Process type (C=Compute/ML, G=Graphics/Display)"),
+    dim("  SM   - Streaming Multiprocessor - GPU compute core utilization %"),
+    dim("  MEM  - Memory - GPU memory controller utilization %"),
+    dim("  ENC  - Encoder - Video encoding engine utilization %"),
+    dim("  DEC  - Decoder - Video decoding engine utilization %"),
+    dim("  JPG  - JPEG - JPEG decoder engine utilization %"),
+    dim("  OFA  - Optical Flow - Optical flow accelerator utilization %"),
+    dim("  FB   - Frame Buffer - GPU memory usage in MB"),
+    dim("  CCPM - Confidential Compute - Protected memory usage in MB"),
+  ].join("\n");
+
+  const debug = dim(
+    `Debug: terminal=${cols}x${rows} | boxWidth=${boxWidth} | maxCmd=${maxCmd}`
+  );
 
   logUpdate(
     [
-      topRow,
+      memBox,
+      "",
+      gpuBox,
       "",
       procBox,
       "",
+      legendLines,
+      "",
+      debug,
       dim(`q / Ctrl+C to quit  ·  ${new Date().toLocaleTimeString()}`),
     ].join("\n")
   );
@@ -202,6 +285,12 @@ function setupKeys() {
 }
 
 async function main(): Promise<void> {
+  if (ONCE_MODE) {
+    await render();
+    logUpdate.done();
+    process.exit(0);
+  }
+  
   setupKeys();
   await render();
   setInterval(() => {
