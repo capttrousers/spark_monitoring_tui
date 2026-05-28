@@ -5,33 +5,30 @@ LOG_DIR="$HOME/vllm-logs"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 mkdir -p "$LOG_DIR"
-
 source ~/.nvm/nvm.sh
 
-echo "vLLM log streamer started. Polling for sparkrun container..."
+# Always-on stats collector. Writes to $LOG_DIR/spark-stats-YYYYMMDD.jsonl (daily rotate).
+echo "Starting stats collector..."
+npx --prefix "$REPO_DIR" tsx "$REPO_DIR/spark_monitoring_procmem.ts" \
+  --json --interval=5000 --log-dir="$LOG_DIR" &
+STATS_PID=$!
+
+# Clean up the stats collector if this script exits for any reason.
+trap "kill $STATS_PID 2>/dev/null || true" EXIT INT TERM
+
+echo "Stats collector PID: $STATS_PID. Polling for sparkrun container..."
 
 while true; do
   CONTAINER=$(docker ps --format '{{.Names}}' | grep sparkrun | head -1)
 
   if [ -n "$CONTAINER" ]; then
-    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-    LOGFILE="$LOG_DIR/vllm-$TIMESTAMP.log"
-    STATSFILE="$LOG_DIR/spark-stats-$TIMESTAMP.jsonl"
+    LOGFILE="$LOG_DIR/vllm-$(date +%Y%m%d-%H%M%S).log"
+    echo "Found container: $CONTAINER -> $LOGFILE"
 
-    echo "Found container: $CONTAINER"
-    echo "  vLLM log  -> $LOGFILE"
-    echo "  GPU stats -> $STATSFILE"
-
-    # Start GPU/memory stats poller in background (every 10s)
-    npx --prefix "$REPO_DIR" tsx "$REPO_DIR/spark_monitoring_procmem.ts" --json --interval=10000 >> "$STATSFILE" 2>&1 &
-    MONITOR_PID=$!
-
-    # Stream vLLM logs (blocks until container dies or stream ends)
+    # Block on vLLM log stream until container dies.
     docker exec "$CONTAINER" tail -F /tmp/sparkrun_serve.log >> "$LOGFILE" 2>&1 || true
 
-    # Stop stats poller when vLLM stream ends
-    kill $MONITOR_PID 2>/dev/null || true
-    echo "Stream ended for $CONTAINER. Re-polling..."
+    echo "vLLM stream ended for $CONTAINER. Re-polling..."
   fi
 
   sleep 5

@@ -7,28 +7,27 @@ Live monitoring TUI and vLLM log persistence for NVIDIA DGX Spark.
 **`spark_monitoring_procmem.ts`** — terminal dashboard + JSON logger for system RAM and GPU stats.
 
 ```bash
-npx tsx spark_monitoring_procmem.ts                    # live TUI
-npx tsx spark_monitoring_procmem.ts --once             # single TUI snapshot, exit
-npx tsx spark_monitoring_procmem.ts --json             # NDJSON stream → redirect to file
-npx tsx spark_monitoring_procmem.ts --json --once      # single JSON snapshot → | jq
-npx tsx spark_monitoring_procmem.ts --json --interval=5000  # 5s polling
+npx tsx spark_monitoring_procmem.ts                          # live TUI
+npx tsx spark_monitoring_procmem.ts --once                   # single TUI snapshot, exit
+npx tsx spark_monitoring_procmem.ts --json                   # NDJSON to stdout
+npx tsx spark_monitoring_procmem.ts --json --once            # single JSON snapshot → | jq
+npx tsx spark_monitoring_procmem.ts --json --log-dir=DIR     # NDJSON to DIR/spark-stats-YYYYMMDD.jsonl (daily rotate)
+npx tsx spark_monitoring_procmem.ts --json --interval=5000   # 5s polling (default 10s)
 ```
 
-**`spark-monitoring.sh`** — polls for a running sparkrun container, then streams:
-- `~/vllm-logs/vllm-<timestamp>.log` — vLLM server output
-- `~/vllm-logs/spark-stats-<timestamp>.jsonl` — GPU/memory stats every 10s
+**`spark-monitoring.sh`** — runs the stats collector continuously and streams vLLM logs whenever a sparkrun container is up:
+- `~/vllm-logs/spark-stats-YYYYMMDD.jsonl` — system stats every 5s, always on, daily-rotated
+- `~/vllm-logs/vllm-<timestamp>.log` — vLLM server output, one file per container session
 
-Both files are timestamped at container start and survive container removal.
+Both survive container removal and crashes.
 
 ## Setup on DGX Spark
 
-### 1. Clone and install deps
+### 1. Clone
 
 ```bash
 git clone git@github.com:capttrousers/spark_monitoring_tui.git ~/spark_monitoring_tui
 cd ~/spark_monitoring_tui
-npm install
-chmod +x spark-monitoring.sh install.sh
 ```
 
 ### 2. Install systemd service
@@ -37,10 +36,10 @@ chmod +x spark-monitoring.sh install.sh
 ./install.sh
 ```
 
-Run as your normal user (NOT with `sudo`). The script detects your username, substitutes
-it into the service template, then calls `sudo` internally only for the systemd-install
-steps. Running the whole script with `sudo` would set `User=root` in the unit file, which
-is wrong.
+Run as your normal user (NOT with `sudo`). The script detects your username, runs
+`npm install`, substitutes the username into the service template, then `sudo`s only for
+the systemd-install steps. Running the whole script with `sudo` would set `User=root`,
+which is wrong — `install.sh` refuses that case.
 
 ### 3. Check it's working
 
@@ -48,14 +47,17 @@ is wrong.
 ls -lh ~/vllm-logs/
 ```
 
-Once a sparkrun container is running you should see both a `.log` and a `.jsonl` file appear.
+You should immediately see a `spark-stats-YYYYMMDD.jsonl` file growing. The
+`vllm-<timestamp>.log` only appears once a sparkrun container is running.
 
 ## Updating
 
 ```bash
-cd ~/spark_monitoring_tui && git pull && npm install
-sudo systemctl restart spark-monitoring.service
+cd ~/spark_monitoring_tui && git pull && ./install.sh
 ```
+
+`install.sh` is idempotent — re-runs `npm install`, re-templates the service file, and
+restarts the unit. That's the entire update flow.
 
 ## Uninstalling
 
@@ -72,8 +74,11 @@ preserved.
 # Last vLLM output before crash
 tail -100 ~/vllm-logs/vllm-<timestamp>.log
 
-# GPU stats around crash time
-tail -20 ~/vllm-logs/spark-stats-<timestamp>.jsonl | jq .
+# Stats around crash time (e.g. GPU temp, throttling)
+tail -20 ~/vllm-logs/spark-stats-$(date -u +%Y%m%d).jsonl | jq .
+
+# Just temps and clocks across today
+jq -c '{ts, temp: .gpu[0].tempC, clk: .gpu[0].smClkMhz}' ~/vllm-logs/spark-stats-$(date -u +%Y%m%d).jsonl
 
 # Search for errors across all vLLM logs
 grep -i "error\|oom\|killed\|exception" ~/vllm-logs/*.log

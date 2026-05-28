@@ -17,6 +17,10 @@ SERVICE_DST="/etc/systemd/system/${SERVICE_NAME}.service"
 echo "Installing ${SERVICE_NAME} for user: $TARGET_USER"
 echo "Repo dir: $REPO_DIR"
 
+# Install/refresh npm deps so the update flow is just: git pull && ./install.sh
+echo "Running npm install..."
+npm install --prefix "$REPO_DIR"
+
 # Resolve template -> /etc/systemd/system/
 sed "s/__USER__/$TARGET_USER/g" "$REPO_DIR/${SERVICE_NAME}.service" \
   | sudo tee "$SERVICE_DST" > /dev/null

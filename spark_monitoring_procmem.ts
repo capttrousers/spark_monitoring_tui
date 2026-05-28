@@ -1,13 +1,16 @@
 // spark_monitoring_procmem.ts
-// Run: npx tsx spark_monitoring_procmem.ts [--once] [--json] [--interval=<ms>]
+// Run: npx tsx spark_monitoring_procmem.ts [--once] [--json] [--interval=<ms>] [--log-dir=<path>]
 //
-//   (no flags)          live TUI, loops every --interval ms (default 1000)
+//   (no flags)          live TUI, loops every --interval ms (default 10000)
 //   --once              single TUI snapshot, exit
-//   --json              NDJSON stream, one line per interval — pipe/redirect to file
+//   --json              NDJSON to stdout, one line per interval — pipe/redirect to file
 //   --json --once       single JSON snapshot, exit — good for | jq
-//   --interval=<ms>     polling interval in ms (default 1000)
-import { $ } from "zx";
+//   --json --log-dir=X  NDJSON to X/spark-stats-YYYYMMDD.jsonl, rotated daily at UTC midnight
+//   --interval=<ms>     polling interval in ms (default 10000)
+import { $, argv } from "zx";
 import fs from "node:fs/promises";
+import { createWriteStream, type WriteStream } from "node:fs";
+import path from "node:path";
 import process from "node:process";
 import logUpdate from "log-update";
 import stringWidth from "string-width";
@@ -16,13 +19,11 @@ import stripAnsi from "strip-ansi";
 
 $.quiet = true;
 
-// ---------- flags ----------
-const args = process.argv.slice(2);
-const FLAG_ONCE = args.includes("--once");
-const FLAG_JSON = args.includes("--json");
-const intervalFlag = args.find((a) => a.startsWith("--interval=")) ??
-  (args.includes("--interval") ? `--interval=${args[args.indexOf("--interval") + 1]}` : undefined);
-const INTERVAL = intervalFlag ? (Number(intervalFlag.split("=")[1]) || 1000) : 1000;
+// ---------- flags (parsed by zx's bundled minimist) ----------
+const FLAG_ONCE = Boolean(argv.once);
+const FLAG_JSON = Boolean(argv.json);
+const INTERVAL  = Number(argv.interval) || 10000;
+const LOG_DIR   = typeof argv["log-dir"] === "string" ? argv["log-dir"] : undefined;
 
 // ---------- types ----------
 type MemInfo = {
@@ -200,12 +201,35 @@ async function render(): Promise<void> {
   ].join("\n"));
 }
 
-// ---------- JSON render ----------
+// ---------- JSON output: stdout or daily-rotated file ----------
+let currentDay = "";
+let currentStream: WriteStream | null = null;
+
+function utcDay(d: Date): string {
+  return d.toISOString().slice(0, 10).replace(/-/g, ""); // YYYYMMDD
+}
+
+function writeLine(line: string, ts: Date): void {
+  if (!LOG_DIR) {
+    process.stdout.write(line);
+    return;
+  }
+  const day = utcDay(ts);
+  if (day !== currentDay) {
+    currentStream?.end();
+    const filePath = path.join(LOG_DIR, `spark-stats-${day}.jsonl`);
+    currentStream = createWriteStream(filePath, { flags: "a" });
+    currentDay = day;
+  }
+  currentStream!.write(line);
+}
+
 async function renderJson(): Promise<void> {
   const [m, g, procs] = await Promise.all([meminfo(), gpuTotals(), pmon()]);
   const used = m.total - m.avail;
-  process.stdout.write(JSON.stringify({
-    ts: new Date().toISOString(),
+  const ts = new Date();
+  const line = JSON.stringify({
+    ts: ts.toISOString(),
     mem: {
       totalGb: +((m.total / 1024 / 1024).toFixed(2)),
       usedGb:  +((used    / 1024 / 1024).toFixed(2)),
@@ -214,10 +238,13 @@ async function renderJson(): Promise<void> {
     },
     gpu: g.map((x, i) => ({ id: i, name: x.name, utilPct: x.util, tempC: x.temp, smClkMhz: x.clk })),
     procs: procs.map((r) => ({ gpu: r.gpu, pid: r.pid, type: r.type, sm: r.sm, mem: r.mem, fbMb: r.fb, cmd: r.cmd })),
-  }) + "\n");
+  }) + "\n";
+  writeLine(line, ts);
 }
 
 // ---------- run ----------
+const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+
 function setupKeys() {
   if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
     process.stdin.setRawMode(true);
@@ -232,8 +259,11 @@ async function main(): Promise<void> {
   if (FLAG_JSON) {
     await renderJson();
     if (FLAG_ONCE) process.exit(0);
-    setInterval(() => { void renderJson(); }, INTERVAL);
-    return;
+    // Sequential loop: render → sleep → render. Each sample completes before the next starts.
+    while (true) {
+      await sleep(INTERVAL);
+      await renderJson();
+    }
   }
 
   if (FLAG_ONCE) {
@@ -244,7 +274,11 @@ async function main(): Promise<void> {
 
   setupKeys();
   await render();
-  setInterval(() => { void render(); }, INTERVAL);
+  // Sequential loop: render → sleep → render. Each frame completes before the next starts.
+  while (true) {
+    await sleep(INTERVAL);
+    await render();
+  }
 }
 
 main().catch((err) => {
