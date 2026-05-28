@@ -34,11 +34,13 @@ chmod +x spark-monitoring.sh install.sh
 ### 2. Install systemd service
 
 ```bash
-sudo ./install.sh
+./install.sh
 ```
 
-`install.sh` substitutes the current user into the service template, copies it to
-`/etc/systemd/system/`, enables it, and starts it.
+Run as your normal user (NOT with `sudo`). The script detects your username, substitutes
+it into the service template, then calls `sudo` internally only for the systemd-install
+steps. Running the whole script with `sudo` would set `User=root` in the unit file, which
+is wrong.
 
 ### 3. Check it's working
 
@@ -54,6 +56,15 @@ Once a sparkrun container is running you should see both a `.log` and a `.jsonl`
 cd ~/spark_monitoring_tui && git pull && npm install
 sudo systemctl restart spark-monitoring.service
 ```
+
+## Uninstalling
+
+```bash
+./uninstall.sh
+```
+
+Stops, disables, and removes the systemd service. Log files in `~/vllm-logs/` are
+preserved.
 
 ## Reading logs after a crash
 
