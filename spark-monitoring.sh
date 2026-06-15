@@ -3,7 +3,7 @@ set -euo pipefail
 
 LOG_DIR="$HOME/vllm-logs"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-METRICS_ACCESS_LOG_RE='GET /metrics HTTP/1\\.1" 200 OK'
+METRICS_ACCESS_LOG_RE='GET /metrics HTTP.*200 OK'
 
 mkdir -p "$LOG_DIR"
 source ~/.nvm/nvm.sh
