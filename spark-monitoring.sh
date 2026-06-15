@@ -18,9 +18,11 @@ declare -A STREAM_PIDS=()
 
 cleanup() {
   kill "$STATS_PID" 2>/dev/null || true
-  for pid in "${STREAM_PIDS[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
-  done
+  if ((${#STREAM_PIDS[@]})); then
+    for pid in "${STREAM_PIDS[@]}"; do
+      kill "$pid" 2>/dev/null || true
+    done
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -44,11 +46,13 @@ stream_container_logs() {
 echo "Stats collector PID: $STATS_PID. Polling for sparkrun containers..."
 
 while true; do
-  for container in "${!STREAM_PIDS[@]:-}"; do
-    if ! kill -0 "${STREAM_PIDS[$container]}" 2>/dev/null; then
-      unset 'STREAM_PIDS[$container]'
-    fi
-  done
+  if ((${#STREAM_PIDS[@]})); then
+    for container in "${!STREAM_PIDS[@]}"; do
+      if ! kill -0 "${STREAM_PIDS[$container]}" 2>/dev/null; then
+        unset 'STREAM_PIDS[$container]'
+      fi
+    done
+  fi
 
   while IFS= read -r container; do
     [ -n "$container" ] || continue
