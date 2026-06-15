@@ -17,9 +17,9 @@ npx tsx spark_monitoring_procmem.ts --json --interval=5000   # 5s polling (defau
 
 **`spark-monitoring.sh`** — runs the stats collector continuously and streams vLLM logs whenever a sparkrun container is up:
 - `~/vllm-logs/spark-stats-YYYYMMDD.jsonl` — system stats every 5s, always on, daily-rotated
-- `~/vllm-logs/vllm-<timestamp>.log` — vLLM server output, one file per container session
+- `~/vllm-logs/vllm-<timestamp>-<container>.log` — vLLM server output, one file per SparkRun container session
 
-Both survive container removal and crashes.
+The vLLM log streamer starts one stream per running `sparkrun_` container and filters successful Prometheus `/metrics` access lines to avoid unbounded scrape noise. Both log families survive container removal and crashes.
 
 ## Setup on DGX Spark
 
@@ -48,7 +48,7 @@ ls -lh ~/vllm-logs/
 ```
 
 You should immediately see a `spark-stats-YYYYMMDD.jsonl` file growing. The
-`vllm-<timestamp>.log` only appears once a sparkrun container is running.
+`vllm-<timestamp>-<container>.log` only appears once a sparkrun container is running.
 
 ## Updating
 
@@ -72,7 +72,7 @@ preserved.
 
 ```bash
 # Last vLLM output before crash
-tail -100 ~/vllm-logs/vllm-<timestamp>.log
+tail -100 ~/vllm-logs/vllm-<timestamp>-<container>.log
 
 # Stats around crash time (e.g. GPU temp, throttling)
 tail -20 ~/vllm-logs/spark-stats-$(date -u +%Y%m%d).jsonl | jq .
