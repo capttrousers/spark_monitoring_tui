@@ -177,6 +177,25 @@ function formatGpuMem(usedMb: number, totalMb: number): string {
   return `mem ${(usedMb / 1024).toFixed(1)}/${(totalMb / 1024).toFixed(1)}GiB`;
 }
 
+function pmonFbUsedMb(procs: PmonRow[], gpuId: number): number {
+  return procs
+    .filter((r) => r.gpu === String(gpuId))
+    .reduce((sum, r) => {
+      const fbMb = Number(r.fb);
+      return Number.isFinite(fbMb) ? sum + fbMb : sum;
+    }, 0);
+}
+
+function normalizeGpuMemory(m: MemInfo, g: GpuTotal[], procs: PmonRow[]): GpuTotal[] {
+  return g.map((gpu, i) => ({
+    ...gpu,
+    // GB10 unified memory reports 0/0 for memory.used,total in nvidia-smi
+    // query-gpu output, while pmon still reports per-process FB usage.
+    memUsedMb: gpu.memUsedMb || pmonFbUsedMb(procs, i),
+    memTotalMb: gpu.memTotalMb || m.total / 1024,
+  }));
+}
+
 function box(title: string, lines: string[], width: number): string {
   const safeWidth = Math.min(width, 78);
   const contentWidth = safeWidth - 4;
@@ -213,6 +232,7 @@ async function render(): Promise<void> {
   const boxWidth = cols;
 
   const [m, g, procs] = await Promise.all([meminfo(), gpuTotals(), pmon()]);
+  const gpuTotalsWithMemory = normalizeGpuMemory(m, g, procs);
   const used = m.total - m.avail;
 
   const memBox = box(cyan("Memory"), [
@@ -225,8 +245,8 @@ async function render(): Promise<void> {
   ], boxWidth);
 
   const gpuBox = box(magenta("GPU Totals"),
-    g.length > 0
-      ? g.map((x, i) => `GPU${i} ${x.name}  util ${green(`${x.util}%`)}  temp ${yellow(`${x.temp}C`)}  smclk ${x.clk}MHz  ${formatGpuMem(x.memUsedMb, x.memTotalMb)}`)
+    gpuTotalsWithMemory.length > 0
+      ? gpuTotalsWithMemory.map((x, i) => `GPU${i} ${x.name}  util ${green(`${x.util}%`)}  temp ${yellow(`${x.temp}C`)}  smclk ${x.clk}MHz  ${formatGpuMem(x.memUsedMb, x.memTotalMb)}`)
       : ["nvidia-smi not available"],
     boxWidth
   );
@@ -288,6 +308,7 @@ function writeLine(line: string, ts: Date): void {
 
 async function collectSample(): Promise<Sample> {
   const [m, g, procs] = await Promise.all([meminfo(), gpuTotals(), pmon()]);
+  const gpuTotalsWithMemory = normalizeGpuMemory(m, g, procs);
   const used = m.total - m.avail;
   const ts = new Date();
   return {
@@ -298,7 +319,7 @@ async function collectSample(): Promise<Sample> {
       availGb: +((m.avail / 1024 / 1024).toFixed(2)),
       swapFreeGb: +((m.swapFree / 1024 / 1024).toFixed(2)),
     },
-    gpu: g.map((x, i) => ({
+    gpu: gpuTotalsWithMemory.map((x, i) => ({
       id: i,
       name: x.name,
       utilPct: x.util,
