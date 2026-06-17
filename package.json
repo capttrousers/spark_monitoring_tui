@@ -1,7 +1,9 @@
 {
+  "name": "spark_monitoring_tui",
   "dependencies": {
     "log-update": "^7.0.2",
     "string-width": "^8.1.0",
+    "tsx": "^4.20.6",
     "wrap-ansi": "^9.0.2",
     "yoctocolors": "^2.1.2",
     "zx": "^8.8.5"

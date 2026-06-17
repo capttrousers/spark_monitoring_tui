@@ -1,11 +1,13 @@
 // spark_monitoring_procmem.ts
-// Run: npx tsx spark_monitoring_procmem.ts [--once] [--json] [--interval=<ms>] [--log-dir=<path>]
+// Run: npx tsx spark_monitoring_procmem.ts [--once] [--json] [--interval=<ms>] [--log-dir=<path>] [--json-log-dir=<path>] [--prom-node-exporter-dir=<path>]
 //
 //   (no flags)          live TUI, loops every --interval ms (default 10000)
 //   --once              single TUI snapshot, exit
 //   --json              NDJSON to stdout, one line per interval — pipe/redirect to file
 //   --json --once       single JSON snapshot, exit — good for | jq
 //   --json --log-dir=X  NDJSON to X/spark-stats-YYYYMMDD.jsonl, rotated daily at UTC midnight
+//   --json-log-dir=X   NDJSON to X/spark-stats-YYYYMMDD.jsonl, implies --json
+//   --prom-node-exporter-dir=X  write X/spark_gpu.prom atomically for node_exporter
 //   --interval=<ms>     polling interval in ms (default 10000)
 import { $, argv } from "zx";
 import fs from "node:fs/promises";
@@ -20,10 +22,14 @@ import stripAnsi from "strip-ansi";
 $.quiet = true;
 
 // ---------- flags (parsed by zx's bundled minimist) ----------
+const FLAG_HELP = Boolean(argv.help) || Boolean(argv.h);
 const FLAG_ONCE = Boolean(argv.once);
-const FLAG_JSON = Boolean(argv.json);
 const INTERVAL  = Number(argv.interval) || 10000;
-const LOG_DIR   = typeof argv["log-dir"] === "string" ? argv["log-dir"] : undefined;
+const JSON_LOG_DIR = typeof argv["json-log-dir"] === "string" ? argv["json-log-dir"] : undefined;
+const LOG_DIR = JSON_LOG_DIR ?? (typeof argv["log-dir"] === "string" ? argv["log-dir"] : undefined);
+const FLAG_JSON = Boolean(argv.json) || Boolean(JSON_LOG_DIR);
+const PROM_NODE_EXPORTER_DIR = typeof argv["prom-node-exporter-dir"] === "string" ? argv["prom-node-exporter-dir"] : undefined;
+const FLAG_HEADLESS = FLAG_JSON || Boolean(PROM_NODE_EXPORTER_DIR);
 
 // ---------- types ----------
 type MemInfo = {
@@ -34,7 +40,14 @@ type MemInfo = {
   swapFree: number;
 };
 
-type GpuTotal = { name: string; util: number; temp: number; clk: number };
+type GpuTotal = {
+  name: string;
+  util: number;
+  temp: number;
+  clk: number;
+  memUsedMb: number;
+  memTotalMb: number;
+};
 
 type PmonRow = {
   gpu: string;
@@ -50,6 +63,47 @@ type PmonRow = {
   ccpm: string;
   cmd: string;
 };
+
+type Sample = {
+  ts: string;
+  mem: {
+    totalGb: number;
+    usedGb: number;
+    availGb: number;
+    swapFreeGb: number;
+  };
+  gpu: {
+    id: number;
+    name: string;
+    utilPct: number;
+    tempC: number;
+    smClkMhz: number;
+    memUsedMb: number;
+    memTotalMb: number;
+  }[];
+  procs: {
+    gpu: string;
+    pid: string;
+    type: string;
+    sm: string;
+    mem: string;
+    fbMb: string;
+    cmd: string;
+  }[];
+};
+
+function usage(): string {
+  return `Usage: spark_monitoring_procmem.ts [options]
+
+Options:
+  --once                         Emit one sample/frame and exit.
+  --json                         Write NDJSON samples to stdout.
+  --log-dir=DIR                  With --json, write daily spark-stats-YYYYMMDD.jsonl files.
+  --json-log-dir=DIR             Write daily JSONL files and imply --json.
+  --prom-node-exporter-dir=DIR   Atomically write DIR/spark_gpu.prom for node_exporter.
+  --interval=MS                  Polling interval. Defaults to 10000.
+  -h, --help                     Show this help.`;
+}
 
 // ---------- data helpers ----------
 async function meminfo(): Promise<MemInfo> {
@@ -70,16 +124,18 @@ async function meminfo(): Promise<MemInfo> {
 async function gpuTotals(): Promise<GpuTotal[]> {
   try {
     const out = (
-      await $`nvidia-smi --query-gpu=name,utilization.gpu,temperature.gpu,clocks.sm --format=csv,noheader,nounits`
+      await $`nvidia-smi --query-gpu=name,utilization.gpu,temperature.gpu,clocks.sm,memory.used,memory.total --format=csv,noheader,nounits`
     ).stdout.trim();
     if (!out) return [];
     return out.split("\n").map((line) => {
-      const [name, util, temp, clk] = line.split(",").map((s) => s.trim());
+      const [name, util, temp, clk, memUsedMb, memTotalMb] = line.split(",").map((s) => s.trim());
       return {
         name,
         util: Number(util) || 0,
         temp: Number(temp) || 0,
         clk: Number(clk) || 0,
+        memUsedMb: Number(memUsedMb) || 0,
+        memTotalMb: Number(memTotalMb) || 0,
       };
     });
   } catch {
@@ -109,10 +165,16 @@ async function pmon(): Promise<PmonRow[]> {
 
 // ---------- TUI helpers ----------
 const toGB = (kb?: number): string => `${((kb || 0) / 1024 / 1024).toFixed(2)} GB`;
+const mbToBytes = (mb: number): number => mb * 1024 * 1024;
 
 function pad(s: string, w: number): string {
   const sw = stringWidth(s);
   return sw >= w ? s : s + " ".repeat(w - sw);
+}
+
+function formatGpuMem(usedMb: number, totalMb: number): string {
+  if (!totalMb) return "mem n/a";
+  return `mem ${(usedMb / 1024).toFixed(1)}/${(totalMb / 1024).toFixed(1)}GiB`;
 }
 
 function box(title: string, lines: string[], width: number): string {
@@ -164,7 +226,7 @@ async function render(): Promise<void> {
 
   const gpuBox = box(magenta("GPU Totals"),
     g.length > 0
-      ? g.map((x, i) => `GPU${i} ${x.name}  util ${green(`${x.util}%`)}  temp ${yellow(`${x.temp}C`)}  smclk ${x.clk}MHz`)
+      ? g.map((x, i) => `GPU${i} ${x.name}  util ${green(`${x.util}%`)}  temp ${yellow(`${x.temp}C`)}  smclk ${x.clk}MHz  ${formatGpuMem(x.memUsedMb, x.memTotalMb)}`)
       : ["nvidia-smi not available"],
     boxWidth
   );
@@ -224,11 +286,11 @@ function writeLine(line: string, ts: Date): void {
   currentStream!.write(line);
 }
 
-async function renderJson(): Promise<void> {
+async function collectSample(): Promise<Sample> {
   const [m, g, procs] = await Promise.all([meminfo(), gpuTotals(), pmon()]);
   const used = m.total - m.avail;
   const ts = new Date();
-  const line = JSON.stringify({
+  return {
     ts: ts.toISOString(),
     mem: {
       totalGb: +((m.total / 1024 / 1024).toFixed(2)),
@@ -236,10 +298,75 @@ async function renderJson(): Promise<void> {
       availGb: +((m.avail / 1024 / 1024).toFixed(2)),
       swapFreeGb: +((m.swapFree / 1024 / 1024).toFixed(2)),
     },
-    gpu: g.map((x, i) => ({ id: i, name: x.name, utilPct: x.util, tempC: x.temp, smClkMhz: x.clk })),
+    gpu: g.map((x, i) => ({
+      id: i,
+      name: x.name,
+      utilPct: x.util,
+      tempC: x.temp,
+      smClkMhz: x.clk,
+      memUsedMb: x.memUsedMb,
+      memTotalMb: x.memTotalMb,
+    })),
     procs: procs.map((r) => ({ gpu: r.gpu, pid: r.pid, type: r.type, sm: r.sm, mem: r.mem, fbMb: r.fb, cmd: r.cmd })),
-  }) + "\n";
-  writeLine(line, ts);
+  };
+}
+
+function promLabel(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/"/g, '\\"');
+}
+
+function promLine(name: string, labels: Record<string, string>, value: number): string {
+  const labelText = Object.entries(labels)
+    .map(([k, v]) => `${k}="${promLabel(v)}"`)
+    .join(",");
+  const metricValue = Number.isFinite(value) ? value : 0;
+  return `${name}{${labelText}} ${metricValue}`;
+}
+
+function buildPrometheusText(sample: Sample): string {
+  const lines: string[] = [
+    "# HELP spark_gpu_temp_celsius Spark GPU temperature in Celsius.",
+    "# TYPE spark_gpu_temp_celsius gauge",
+    "# HELP spark_gpu_util_percent Spark GPU utilization percent.",
+    "# TYPE spark_gpu_util_percent gauge",
+    "# HELP spark_gpu_sm_clock_mhz Spark GPU SM clock in MHz.",
+    "# TYPE spark_gpu_sm_clock_mhz gauge",
+    "# HELP spark_gpu_mem_used_bytes Spark GPU memory used in bytes.",
+    "# TYPE spark_gpu_mem_used_bytes gauge",
+    "# HELP spark_gpu_mem_total_bytes Spark GPU memory total in bytes.",
+    "# TYPE spark_gpu_mem_total_bytes gauge",
+    "# HELP spark_gpu_textfile_last_success_timestamp_seconds Last successful Spark GPU textfile sample timestamp.",
+    "# TYPE spark_gpu_textfile_last_success_timestamp_seconds gauge",
+  ];
+
+  for (const gpu of sample.gpu) {
+    const labels = { gpu: String(gpu.id), name: gpu.name };
+    lines.push(promLine("spark_gpu_temp_celsius", labels, gpu.tempC));
+    lines.push(promLine("spark_gpu_util_percent", labels, gpu.utilPct));
+    lines.push(promLine("spark_gpu_sm_clock_mhz", labels, gpu.smClkMhz));
+    lines.push(promLine("spark_gpu_mem_used_bytes", labels, mbToBytes(gpu.memUsedMb)));
+    lines.push(promLine("spark_gpu_mem_total_bytes", labels, mbToBytes(gpu.memTotalMb)));
+  }
+
+  lines.push(`spark_gpu_textfile_last_success_timestamp_seconds ${Math.floor(Date.parse(sample.ts) / 1000)}`);
+  return `${lines.join("\n")}\n`;
+}
+
+async function writePrometheusText(sample: Sample): Promise<void> {
+  if (!PROM_NODE_EXPORTER_DIR) return;
+  await fs.mkdir(PROM_NODE_EXPORTER_DIR, { recursive: true });
+  const finalPath = path.join(PROM_NODE_EXPORTER_DIR, "spark_gpu.prom");
+  const tmpPath = path.join(PROM_NODE_EXPORTER_DIR, `.spark_gpu.prom.${process.pid}.tmp`);
+  await fs.writeFile(tmpPath, buildPrometheusText(sample), "utf8");
+  await fs.rename(tmpPath, finalPath);
+}
+
+async function renderHeadless(): Promise<void> {
+  const sample = await collectSample();
+  if (FLAG_JSON) {
+    writeLine(`${JSON.stringify(sample)}\n`, new Date(sample.ts));
+  }
+  await writePrometheusText(sample);
 }
 
 // ---------- run ----------
@@ -256,13 +383,18 @@ function setupKeys() {
 }
 
 async function main(): Promise<void> {
-  if (FLAG_JSON) {
-    await renderJson();
+  if (FLAG_HELP) {
+    console.log(usage());
+    process.exit(0);
+  }
+
+  if (FLAG_HEADLESS) {
+    await renderHeadless();
     if (FLAG_ONCE) process.exit(0);
     // Sequential loop: render → sleep → render. Each sample completes before the next starts.
     while (true) {
       await sleep(INTERVAL);
-      await renderJson();
+      await renderHeadless();
     }
   }
 

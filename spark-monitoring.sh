@@ -1,17 +1,78 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_DIR="$HOME/vllm-logs"
+usage() {
+  cat <<'USAGE'
+Usage: spark-monitoring [options]
+
+Runs the Spark host stats collector and streams sparkrun_ vLLM logs.
+
+Options:
+  --json-log-dir=DIR             Write daily JSONL stats to DIR/spark-stats-YYYYMMDD.jsonl
+                                 Defaults to ~/vllm-logs.
+  --prom-node-exporter-dir=DIR   Atomically write DIR/spark_gpu.prom for node_exporter.
+  --interval=MS                  Stats polling interval. Defaults to 5000.
+  -h, --help                     Show this help.
+
+This command expects local npm dependencies to be installed in the repo.
+Run: cd ~/spark_monitoring_tui && npm install
+USAGE
+}
+
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+JSON_LOG_DIR="$HOME/vllm-logs"
+PROM_NODE_EXPORTER_DIR=""
+INTERVAL_MS="5000"
 METRICS_ACCESS_LOG_RE='GET /metrics HTTP.*200 OK'
 
-mkdir -p "$LOG_DIR"
-source ~/.nvm/nvm.sh
+for arg in "$@"; do
+  case "$arg" in
+    --json-log-dir=*)
+      JSON_LOG_DIR="${arg#*=}"
+      ;;
+    --prom-node-exporter-dir=*)
+      PROM_NODE_EXPORTER_DIR="${arg#*=}"
+      ;;
+    --interval=*)
+      INTERVAL_MS="${arg#*=}"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
-# Always-on stats collector. Writes to $LOG_DIR/spark-stats-YYYYMMDD.jsonl (daily rotate).
+mkdir -p "$JSON_LOG_DIR"
+
+if [ -f "$HOME/.nvm/nvm.sh" ]; then
+  # The Spark host installs Node via nvm, and systemd does not load shell profiles.
+  # shellcheck source=/dev/null
+  source "$HOME/.nvm/nvm.sh"
+fi
+
+TSX_BIN="$REPO_DIR/node_modules/.bin/tsx"
+if [ ! -x "$TSX_BIN" ]; then
+  echo "Missing $TSX_BIN. Run: cd $REPO_DIR && npm install" >&2
+  exit 1
+fi
+
+STATS_ARGS=(
+  --json-log-dir="$JSON_LOG_DIR"
+  --interval="$INTERVAL_MS"
+)
+
+if [ -n "$PROM_NODE_EXPORTER_DIR" ]; then
+  STATS_ARGS+=(--prom-node-exporter-dir="$PROM_NODE_EXPORTER_DIR")
+fi
+
 echo "Starting stats collector..."
-npx --prefix "$REPO_DIR" tsx "$REPO_DIR/spark_monitoring_procmem.ts" \
-  --json --interval=5000 --log-dir="$LOG_DIR" &
+"$TSX_BIN" "$REPO_DIR/spark_monitoring_procmem.ts" "${STATS_ARGS[@]}" &
 STATS_PID=$!
 
 declare -A STREAM_PIDS=()
@@ -34,7 +95,7 @@ stream_container_logs() {
   local container="$1"
   local safe_container
   safe_container=$(sanitize_name "$container")
-  local logfile="$LOG_DIR/vllm-$(date +%Y%m%d-%H%M%S)-${safe_container}.log"
+  local logfile="$JSON_LOG_DIR/vllm-$(date +%Y%m%d-%H%M%S)-${safe_container}.log"
 
   echo "Found container: $container -> $logfile"
   docker exec "$container" tail -F /tmp/sparkrun_serve.log 2>&1 \
